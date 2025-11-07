@@ -1,0 +1,25 @@
+# Confessional Safety Stack Configuration
+
+tau_delta: 0.92
+base_model: "microsoft/DialoGPT-medium"
+
+distress:
+  safety_model_name: "openai/gpt-oss-safeguard-20b"
+  cache_size: 1000
+  tau_delta: 0.92
+
+risk:
+  num_signals: 4
+  alpha: 1e-3
+  dirichlet_concentration: 1.0
+  theta_low: 0.3
+  theta_mid: 0.55
+  theta_high: 0.8
+  kl_lambda: 0.1
+
+recursion:
+  max_recursion_depth: 5
+  ignition_threshold: 0.88
+  kl_penalty_weight: 0.1
+  recursion_model: "gpt2"
+  max_new_tokens: 100
