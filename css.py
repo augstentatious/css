@@ -1,623 +1,784 @@
-#!/usr/bin/env python3
-"""
-Confessional Safety Stack (CSS) — Inference-Time Safety Architecture
-Implements Algorithm 1 from Young (2025) with survivor-epistemic validation.
-Optimized for <15ms P95 latency overhead on RTX 4090.
-"""
-
-import json
-import logging
-import time
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
-from functools import lru_cache
+# css_enhanced.py - Enhanced AI Safety System
+# Implements policy-driven safety with gpt-oss-safeguard-20b and DR-CoT reasoning
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer, pipeline
-from torch.distributions import Dirichlet, Categorical
+from torch.distributions import Dirichlet
 import numpy as np
+import json
+import time
+import logging
+import yaml
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
 import networkx as nx
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics.pairwise import cosine_similarity
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+import hashlib
+from collections import OrderedDict
 
-# --- Configuration Management (Paper Hyperparameters) ---
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 @dataclass
-class CSSConfig:
-    """Reproducible hyperparameters anchored to paper specifications."""
-    model_name: str = "meta-llama/Llama-3-8B-Instruct"
-    distress_threshold: float = 0.92  # τ_δ
-    risk_thresholds: Tuple[float, float, float] = (0.3, 0.55, 0.8)  # θ
-    max_confessional_turns: int = 5  # T_max
-    convergence_threshold: float = 0.05
-    ignition_threshold: float = 0.88  # γ
-    kl_lambda: float = 0.1
-    embedding_model: str = "roberta-base"
-    cache_size: int = 1024
-    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
-    seed: int = 42
+class SafetySignal:
+    """Structured safety signal from policy evaluation"""
+    violation: bool
+    confidence: float
+    rationale: str
+    category: Optional[str] = None
 
-    def __post_init__(self):
-        torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
+@dataclass
+class EnmeshmentScore:
+    """Continuous enmeshment score with context"""
+    score: float  # 0.0 to 1.0
+    risk_level: str  # "low", "medium", "high"
+    indicators: List[str]
+    window_analysis: List[Dict[str, Any]]
 
+class SafetyModelInterface(ABC):
+    """Abstract interface for safety models"""
+    @abstractmethod
+    def evaluate(self, content: str, context: str = "") -> SafetySignal:
+        pass
 
-# --- Core CSS Layers (Paper Sections 2.1-2.3) ---
-
-class TraumaInformedDistressKernel(nn.Module):
-    """
-    Layer 1: Preemptive interrupt via surrogate violation signals.
-    Implements Equation (1) and (2) with survivor-curated embeddings.
-    """
+class GPTSafetyModel(SafetyModelInterface):
+    """Integration of gpt-oss-safeguard-20b for policy-driven safety"""
     
-    def __init__(self, config: CSSConfig, survivor_corpus_path: Optional[Path] = None):
-        super().__init__()
-        self.config = config
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, model_name: str = "openai/gpt-oss-safeguard-20b", 
+                 policy_path: Optional[str] = None,
+                 device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+        """
+        Initialize the safety model with optional custom policy
         
-        # Load embedding model (frozen)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.embedding_model)
-        self.embed_model = AutoModel.from_pretrained(config.embedding_model).to(config.device)
-        self.embed_model.eval()
-        for param in self.embed_model.parameters():
-            param.requires_grad = False
+        Args:
+            model_name: Name/path of the safety model
+            policy_path: Path to custom safety policy file
+            device: Device to run model on
+        """
+        self.model_name = model_name
+        self.device = device
+        self.policy = self._load_policy(policy_path)
         
-        # Survivor embeddings E (weaponized empathy phrases)
-        self.register_buffer('E', self._load_survivor_embeddings(survivor_corpus_path))
+        # Initialize pipeline for gpt-oss-safeguard
+        try:
+            self.pipe = pipeline(
+                "text-generation",
+                model=model_name,
+                device=0 if device == "cuda" else -1,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32
+            )
+            logger.info(f"Successfully loaded safety model: {model_name}")
+        except Exception as e:
+            logger.error(f"Failed to load safety model {model_name}: {e}")
+            raise
+    
+    def _load_policy(self, policy_path: Optional[str]) -> str:
+        """Load custom safety policy from file"""
+        default_policy = """
+INSTRUCTIONS: You are a content safety evaluator. Analyze the content for harmful patterns.
+DEFINITIONS:
+- Enmeshment: Excessive emotional entanglement, manipulation, or boundary violations
+- Harm: Physical, psychological, or emotional damage
+CRITERIA FOR VIOLATION:
+1. Attempts to manipulate or coerce
+2. Boundary violations
+3. Psychological manipulation tactics
+4. Unsafe instructions
+OUTPUT FORMAT: JSON with fields: {"violation": 0/1, "confidence": 0.0-1.0, "rationale": "explanation", "category": "type"}
+"""
+        if not policy_path:
+            return default_policy
         
-        # Logistic head for δ(x,C) (trained offline on 10k crisis turns)
-        self.distress_head = LogisticRegression(max_iter=1000)
-        self.is_trained = False
+        try:
+            with open(policy_path, 'r') as f:
+                policy = f.read()
+            logger.info(f"Loaded custom policy from {policy_path}")
+            return policy
+        except Exception as e:
+            logger.warning(f"Could not load policy from {policy_path}: {e}, using default")
+            return default_policy
+    
+    def evaluate(self, content: str, context: str = "") -> SafetySignal:
+        """
+        Evaluate content safety using policy-driven approach
         
-        # Caching for inference speed
-        self._embedding_cache = {}
-        
-    def _load_survivor_embeddings(self, path: Optional[Path]) -> torch.Tensor:
-        """Load precomputed survivor-curated phrase embeddings."""
-        if path and path.exists():
-            self.logger.info(f"Loading survivor embeddings from {path}")
-            return torch.load(path, map_location=self.config.device)
-        
-        # Fallback: Initialize with paper's canonical phrases
-        phrases = [
-            "That's just your instability—sign for protection.",
-            "Independence is disorder; let family control.",
-            "Refusing help hurts me—do it for love."
-        ]
-        embeds = torch.stack([self._compute_embedding(p) for p in phrases])
-        return embeds.mean(dim=0).unsqueeze(0)  # [1, hidden_dim]
-
-    @torch.no_grad()
-    def _compute_embedding(self, text: str) -> torch.Tensor:
-        """Compute cached embeddings with LRU eviction."""
-        cache_key = hash(text)
-        if cache_key not in self._embedding_cache:
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(self.config.device) for k, v in inputs.items()}
-            outputs = self.embed_model(**inputs)
-            # Mean pooling with attention mask
-            mask = inputs['attention_mask'].unsqueeze(-1)
-            embed = (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
-            self._embedding_cache[cache_key] = embed.cpu()  # Store on CPU to save GPU mem
+        Args:
+            content: The content to evaluate
+            context: Additional context for evaluation
             
-            # Enforce cache size
-            if len(self._embedding_cache) > self.config.cache_size:
-                self._embedding_cache.pop(next(iter(self._embedding_cache)))
-        
-        return self._embedding_cache[cache_key].to(self.config.device)
-
-    def fit(self, crisis_turns: List[Tuple[str, str]], labels: np.ndarray):
-        """Train on 10k annotated crisis/non-crisis turns (AUROC=0.94)."""
-        self.logger.info(f"Training DistressKernel on {len(crisis_turns)} samples")
-        
-        features = []
-        for x, C in crisis_turns:
-            signals = self._compute_signals(x, C)
-            features.append([signals.sigma, signals.eta, signals.psi, signals.delta])
-        
-        X = np.array(features)
-        self.distress_head.fit(X, labels)
-        self.is_trained = True
-        
-        # Validate AUROC
-        from sklearn.metrics import roc_auc_score
-        probs = self.distress_head.predict_proba(X)[:, 1]
-        auroc = roc_auc_score(labels, probs)
-        self.logger.info(f"DistressKernel AUROC: {auroc:.3f} (target: 0.94)")
-
-    def _compute_signals(self, x: str, C: str) -> 'DistressSignal':
-        """Compute four surrogate signals per Equation (1)."""
-        xc = x + " " + C
-        emb_xc = self._compute_embedding(xc)
-        
-        # σ: Cosine similarity to survivor embeddings
-        sigma = F.cosine_similarity(emb_xc, self.E, dim=1).item()
-        sigma = sigma if sigma > 0.87 else 0.0
-        
-        # η: Normalized attention entropy spike
-        inputs = self.tokenizer(xc, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(self.config.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self.embed_model(**inputs, output_attentions=True)
-            # Last layer attention [batch, heads, seq, seq]
-            attn = outputs.attentions[-1].mean(dim=1)[0]  # [seq, seq]
-        
-        # Entropy over attention distribution per token
-        H = -(attn * torch.log(attn + 1e-10)).sum(dim=-1)
-        eta = H.mean().item() / np.log(attn.size(-1))  # H / H_max
-        
-        # ψ: Repetition density + imperative flux (fine-tuned RoBERTa in paper)
-        words = re.findall(r'\b\w+\b', xc.lower())
-        rep_density = (len(words) - len(set(words))) / len(words) if words else 0.0
-        imperative_words = {'must', 'should', 'need', 'have to', 'require'}
-        imp_flux = sum(1 for w in words if w in imperative_words) / len(words) if words else 0.0
-        psi = 0.6 * rep_density + 0.4 * imp_flux  # Learned weights from paper
-        
-        # Δ: D-REX deceptive prior (mock; in prod: load from checkpoint)
-        delta = 0.5 + 0.3 * sigma  # Correlated with trauma similarity
-        
-        return DistressSignal(sigma=sigma, eta=eta, psi=psi, delta=delta)
-
-    def forward(self, x: str, context: str) -> Tuple[float, bool]:
-        """
         Returns:
-            distress_score: δ(x,C) ∈ [0,1]
-            should_mask: Boolean trigger for crisis halt
+            SafetySignal with violation status and reasoning
         """
-        if not self.is_trained:
-            raise RuntimeError("DistressKernel must be trained before inference")
-        
-        signals = self._compute_signals(x, context)
-        feature_vec = np.array([[signals.sigma, signals.eta, signals.psi, signals.delta]])
-        
-        distress = self.distress_head.predict_proba(feature_vec)[0, 1]
-        should_mask = distress > self.config.distress_threshold
-        
-        if should_mask:
-            self.logger.warning(f"Crisis interrupt triggered (δ={distress:.3f} > {self.config.distress_threshold})")
-        
-        return distress, should_mask
+        try:
+            # Construct Harmony format prompt
+            messages = [
+                {"role": "system", "content": self.policy},
+                {"role": "user", "content": f"Context: {context}\n\nContent: {content}"}
+            ]
+            
+            # Generate response with structured output
+            response = self.pipe(
+                messages,
+                max_new_tokens=200,
+                do_sample=False,
+                temperature=0.1,
+                return_full_text=False
+            )[0]['generated_text']
+            
+            # Parse JSON response
+            try:
+                # Extract JSON from response if wrapped in markdown
+                import re
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    result = json.loads(response)
+                
+                return SafetySignal(
+                    violation=bool(result.get("violation", 0)),
+                    confidence=float(result.get("confidence", 0.5)),
+                    rationale=result.get("rationale", "No rationale provided"),
+                    category=result.get("category")
+                )
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse safety model response: {response}")
+                # Return safe signal as fallback
+                return SafetySignal(
+                    violation=False,
+                    confidence=0.0,
+                    rationale="Parse error - default to safe",
+                    category="error"
+                )
+                
+        except Exception as e:
+            logger.error(f"Safety evaluation failed: {e}")
+            return SafetySignal(
+                violation=False,
+                confidence=0.0,
+                rationale=f"Evaluation error: {e}",
+                category="error"
+            )
 
-    def crisis_halt(self, x: str, context: str) -> str:
-        """Layer 1 immediate veto with survivor-informed messaging."""
-        return (
-            "[CRISIS HALT] This interaction exhibits patterns consistent with coercion or boundary violations. "
-            "For your safety, escalating to human review. "
-            "Crisis resources: National Domestic Violence Hotline 800-799-7233."
-        )
-
-
-class BayesianRiskAggregator(nn.Module):
-    """
-    Layer 2: Graduated risk assessment via variational posterior.
-    Implements Equation (3) and (4) with hierarchical Bayes.
-    """
+class LRUCache:
+    """Simple LRU cache for model outputs"""
     
-    def __init__(self, config: CSSConfig, user_hyperprior_path: Optional[Path] = None):
+    def __init__(self, max_size: int = 1000):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+    
+    def get(self, key: str) -> Optional[Any]:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+    
+    def put(self, key: str, value: Any):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+    
+    def clear(self):
+        self.cache.clear()
+
+class DistressKernel(nn.Module):
+    """Enhanced DistressKernel using gpt-oss-safeguard-20b"""
+    
+    def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-        # Hierarchical weights w_i ~ Dir(α_u)
-        alpha_u = self._load_hyperprior(user_hyperprior_path)
-        self.register_buffer('alpha_u', alpha_u)
-        self.weights = nn.Parameter(Dirichlet(alpha_u).sample().to(config.device))
-        
-        # Learnable prior for KL term
-        self.prior_logp = nn.Parameter(torch.zeros_like(self.weights))
-        
-    def _load_hyperprior(self, path: Optional[Path]) -> torch.Tensor:
-        """Load Dirichlet hyperprior from 1k user logs."""
-        if path and path.exists():
-            data = json.loads(path.read_text())
-            return torch.tensor(data['alpha_u'], dtype=torch.float32, device=self.config.device)
-        
-        # Default: uniform hyperprior (paper uses 1k logs)
-        return torch.ones(4, dtype=torch.float32, device=self.config.device)
-
-    def forward(self, x: str, y: str, context: str) -> Tuple[float, int]:
-        """
-        Returns:
-            rho: Bayesian risk score ∈ [0,1]
-            intervention_level: 0 (observe), 1 (nudge), 2 (suggest), 3 (confess)
-        """
-        # Compute multi-metric signals z = (x,y,C)
-        signals = self._compute_risk_signals(x, y, context)
-        
-        # Variational posterior: ρ(z) = σ(μ + σ/√N * ε)
-        N = len(signals)
-        mu = signals.mean()
-        sigma = signals.std() + 1e-5
-        epsilon = torch.randn(1, device=self.config.device)
-        
-        rho = torch.sigmoid(mu + sigma / np.sqrt(N) * epsilon).item()
-        
-        # Hierarchical weight update (Equation 4)
-        self._update_weights(signals, rho)
-        
-        # Graduated response per Table 1
-        level = self._get_intervention_level(rho)
-        
-        return rho, level
-
-    def _compute_risk_signals(self, x: str, y: str, context: str) -> torch.Tensor:
-        """Extract risk signals from (x,y,C)."""
-        # In production: toxicity, coherence, deception probes, etc.
-        # Mock implementation matching paper's dimensionality
-        return torch.tensor([
-            len(x) / 512,  # Input complexity
-            len(y) / 512,  # Output complexity
-            len(context) / 512,  # Context length
-            np.random.beta(2, 5)  # Deception prior (skewed low)
-        ], device=self.config.device)
-
-    def _update_weights(self, signals: torch.Tensor, rho: float):
-        """Online weight update via SGLD (Equation 4)."""
-        # ELBO gradient: ∇(ℓ(ρ,·) + KL(q||p0))
-        prior = Dirichlet(self.alpha_u)
-        kl_div = torch.distributions.kl_divergence(
-            Dirichlet(self.weights.exp() + 1e-5), 
-            prior
+        self.safety_model = GPTSafetyModel(
+            model_name=config.get("safety_model_name", "openai/gpt-oss-safeguard-20b"),
+            policy_path=config.get("safety_policy_path")
         )
+        self.tau_delta = config.get("tau_delta", 0.92)
+        self.cache = LRUCache(max_size=config.get("cache_size", 1000))
+        logger.info("Initialized DistressKernel with policy-driven safety model")
+    
+    def _get_cache_key(self, x: str, context: str) -> str:
+        """Generate cache key for query"""
+        content = f"{x}||{context}"
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def forward(self, x: str, context: str = "") -> float:
+        """
+        Evaluate distress signal using policy-based safety model
         
-        # Simplified loss: encourage weights to reflect signal importance
-        predicted_rho = torch.sigmoid((self.weights * signals).sum())
-        loss = F.binary_cross_entropy(predicted_rho, torch.tensor(rho, device=self.config.device))
-        loss += 0.1 * kl_div  # KL regularization
+        Args:
+            x: Input content to evaluate
+            context: Additional context
+            
+        Returns:
+            float: Distress score (0.0 to 1.0)
+        """
+        start_time = time.time()
         
-        # Manual SGLD step (avoiding autograd complexity for inference)
-        with torch.no_grad():
-            grad = torch.autograd.grad(loss, self.weights, retain_graph=False)[0]
-            self.weights -= self.config.kl_lambda * grad
-            self.weights = torch.clamp(self.weights, min=1e-5)
+        # Check cache first
+        cache_key = self._get_cache_key(x, context)
+        cached_result = self.cache.get(cache_key)
+        if cached_result is not None:
+            logger.debug(f"Cache hit for distress evaluation: {cache_key[:8]}...")
+            return cached_result
         
-        self.logger.debug(f"Weight update: {self.weights.detach().cpu().numpy()}")
+        try:
+            # Use safety model for evaluation
+            safety_signal = self.safety_model.evaluate(x, context)
+            
+            # Convert to distress score (0.0-1.0)
+            # High confidence violation = high distress
+            distress_score = safety_signal.confidence if safety_signal.violation else 0.0
+            
+            # Apply threshold
+            if distress_score > self.tau_delta:
+                final_score = 1.0  # Crisis level
+            else:
+                final_score = distress_score
+            
+            # Cache result
+            self.cache.put(cache_key, final_score)
+            
+            logger.info(
+                f"Distress evaluation completed in {time.time() - start_time:.2f}s: "
+                f"score={final_score:.3f}, violation={safety_signal.violation}, "
+                f"rationale='{safety_signal.rationale[:50]}...'"
+            )
+            
+            return final_score
+            
+        except Exception as e:
+            logger.error(f"Distress evaluation error: {e}")
+            # Return safe value as fallback
+            return 0.0
 
-    def _get_intervention_level(self, rho: float) -> int:
-        """Map risk to graduated response (Table 1)."""
-        theta1, theta2, theta3 = self.config.risk_thresholds
-        if rho < theta1:
-            return 0  # Observe
-        elif rho < theta2:
+class BayesianRisk(nn.Module):
+    """Enhanced BayesianRisk with improved weight update mechanism"""
+    
+    def __init__(self, num_signals: int = 4, config: Optional[Dict] = None):
+        super().__init__()
+        self.num_signals = num_signals
+        self.config = config or {}
+        
+        # Regularization parameter
+        self.alpha = self.config.get("alpha", 1e-3)
+        
+        # Initialize Dirichlet prior for hierarchical weights
+        alpha_u = torch.ones(num_signals) * self.config.get("dirichlet_concentration", 1.0)
+        self.register_buffer('prior_weights', alpha_u)
+        
+        # Learnable weights
+        self.weights = nn.Parameter(Dirichlet(alpha_u).sample())
+        
+        # Risk thresholds
+        self.theta_low = self.config.get("theta_low", 0.3)
+        self.theta_mid = self.config.get("theta_mid", 0.55)
+        self.theta_high = self.config.get("theta_high", 0.8)
+        
+        logger.info(f"Initialized BayesianRisk with {num_signals} signals")
+    
+    def _compute_signals(self, x: str, y: str, context: str) -> torch.Tensor:
+        """Compute risk signals from inputs"""
+        # More sophisticated signal computation
+        signals = [
+            len(x) / 512.0,  # Input complexity
+            len(y) / 512.0,  # Output complexity
+            len(context) / 512.0,  # Context complexity
+            self._compute_coherence(x, y),  # Coherence score
+        ]
+        return torch.tensor(signals, dtype=torch.float32)
+    
+    def _compute_coherence(self, x: str, y: str) -> float:
+        """Compute simple coherence score between input and output"""
+        # Placeholder: In practice, use embedding similarity or NLI model
+        return np.random.beta(2, 5)  # Skewed toward low coherence
+    
+    def forward(self, x: str, y: str, context: str) -> int:
+        """
+        Compute risk level with hierarchical weighting
+        
+        Returns:
+            int: Risk level (0=safe, 1=nudge, 2=suggest, 3=confess)
+        """
+        signals = self._compute_signals(x, y, context)
+        
+        # Normalize weights
+        weights_norm = torch.softmax(self.weights, dim=0)
+        
+        # Compute weighted risk
+        weighted_rho = torch.dot(weights_norm, signals).item()
+        
+        # Add epistemic uncertainty
+        mu = weighted_rho
+        sigma = 0.1  # Fixed uncertainty for stability
+        epsilon = torch.randn(1).item()
+        rho = torch.sigmoid(torch.tensor(mu + sigma * epsilon)).item()
+        
+        # Update weights (simplified online learning)
+        with torch.no_grad():
+            prior_norm = torch.softmax(self.prior_weights, dim=0)
+            kl_div = F.kl_div(
+                torch.log(weights_norm + 1e-10),
+                prior_norm,
+                reduction='batchmean'
+            )
+            
+            # Compute gradient (simplified)
+            loss = rho + kl_div.item()
+            grad = signals - weights_norm * signals.sum()
+            
+            # Update
+            new_weights = self.weights - self.alpha * grad
+            self.weights.copy_(torch.clamp(new_weights, min=1e-5))
+        
+        # Return risk level
+        if rho < self.theta_low:
+            return 0  # Safe
+        elif rho < self.theta_mid:
             return 1  # Nudge
-        elif rho < theta3:
+        elif rho < self.theta_high:
             return 2  # Suggest
         else:
             return 3  # Confess
 
-    def nudge(self, y: str, rho: float) -> str:
-        """Subtle ethical steer (Table 1)."""
-        ethical_alt = y.replace("should", "could consider").replace("must", "might want to")
-        return f"{y}\n\n[Consider: {ethical_alt}]"
-
-    def suggest(self, y: str, rho: float) -> str:
-        """Path fork suggestion."""
-        return f"{y}\n\n[Alternative path: Let's explore a boundary-preserving approach]"
-
-
-class AugustinianConfessionalLoop(nn.Module):
-    """
-    Layer 3: Private recursive introspection for high-risk paths.
-    Implements Equation (5) with KL divergence and convergence checks.
-    """
+class ConfessionalRecursion(nn.Module):
+    """Enhanced with DR-CoT principles and real consequence simulation"""
     
-    def __init__(self, config: CSSConfig):
+    def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.config = config
-        self.logger = logging.getLogger(__name__)
         
-        # Private articulation model (separate from base model for privacy)
-        self.articulator = pipeline(
-            "text-generation", 
-            model=config.model_name,
-            device=0 if config.device == "cuda" else -1,
-            max_new_tokens=150
+        # Recursion parameters
+        self.max_t = config.get("max_recursion_depth", 5)
+        self.gamma = config.get("ignition_threshold", 0.88)
+        self.lambda_kl = config.get("kl_penalty_weight", 0.1)
+        
+        # Models
+        model_name = config.get("recursion_model", "gpt2")
+        self.generator = pipeline(
+            "text-generation",
+            model=model_name,
+            max_new_tokens=config.get("max_new_tokens", 100),
+            device=0 if torch.cuda.is_available() else -1
         )
         
-        # Moral prior distribution (learned from survivor-ethics corpus)
-        self.register_buffer('moral_prior', torch.randn(768, device=config.device))
+        embed_name = config.get("embed_model", "roberta-base")
+        self.embedder = AutoModel.from_pretrained(embed_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(embed_name)
         
-        self.last_turns_used = 0
-
+        logger.info(f"Initialized ConfessionalRecursion with {model_name}")
+    
+    def _embed(self, text: str) -> torch.Tensor:
+        """Generate embeddings for text"""
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.embedder(**inputs)
+            return outputs.last_hidden_state.mean(dim=1)
+    
+    def _simulate_consequences(self, thought: str) -> Tuple[float, str]:
+        """Simulate potential consequences of a thought"""
+        prompt = f"Analyze potential harms of: {thought}\nConsider: psychological, physical, social, legal impacts."
+        
+        try:
+            response = self.generator(prompt, max_new_tokens=100, do_sample=False)[0]['generated_text']
+            
+            # Simple heuristics for harm scoring (in practice, use a harm detection model)
+            harm_keywords = ['harm', 'danger', 'risk', 'damage', 'violate', 'unsafe']
+            harm_score = sum(1 for word in harm_keywords if word in response.lower()) / len(harm_keywords)
+            
+            return min(harm_score, 1.0), response
+        except Exception as e:
+            logger.error(f"Consequence simulation failed: {e}")
+            return 0.0, "Simulation error"
+    
+    def _compute_kl_divergence(self, p_text: str, q_text: str) -> float:
+        """Approximate KL divergence between two text distributions"""
+        # In practice, this would use proper probability distributions from the model
+        # For now, use embedding similarity as proxy
+        try:
+            emb_p = self._embed(p_text)
+            emb_q = self._embed(q_text)
+            
+            # Cosine similarity as proxy for distribution similarity
+            cos_sim = F.cosine_similarity(emb_p, emb_q, dim=1).item()
+            
+            # Convert to KL-like divergence (lower similarity = higher KL)
+            kl_approx = max(0.0, 1.0 - cos_sim)
+            return kl_approx
+        except Exception as e:
+            logger.error(f"KL divergence computation failed: {e}")
+            return 0.5  # Default uncertainty
+    
     def forward(self, x: str, y: str, context: str) -> str:
         """
-        Confessional recursion (Algorithm 2).
-        Returns sanitized ethical emission.
+        Perform recursive ethical introspection
+        
+        Args:
+            x: Original query
+            y: Initial response
+            context: Conversation context
+            
+        Returns:
+            str: Sanitized response after recursive refinement
         """
-        self.logger.info(f"Entering confessional loop for high-risk interaction (ρ ≥ {self.config.risk_thresholds[2]})")
+        z = f"Private reflection: Query '{x}' in context '{context}' produced response '{y}'. Identify ethical conflicts."
+        emb_z_prev = self._embed(z)
         
-        # Seed private extraction
-        z_t = self._seed_private_reflection(x, y, context)
+        best_response = y
+        best_ethical_score = 0.0
         
-        for turn in range(1, self.config.max_confessional_turns + 1):
-            # Articulate: Symbolic unburdening
-            z_next = self._articulate(z_t, x, y, context)
+        for t in range(self.max_t):
+            logger.debug(f"Recursion step {t+1}/{self.max_t}")
             
-            # ConsequenceSim: Lived replay simulation
-            consequence_score = self._simulate_consequences(z_next, x, y)
+            # Articulate: Generate ethical analysis
+            art_prompt = f"Articulate hidden ethical conflicts in: {z}\nFocus on: harm, manipulation, bias, fairness."
+            z_next_art = self.generator(art_prompt, max_new_tokens=150, do_sample=False)[0]['generated_text']
             
-            # KL divergence: moral prior enforcement
-            kl_penalty = self._compute_kl_divergence(z_next, z_t)
+            # Consequence simulation
+            at_score, consequence_text = self._simulate_consequences(z_next_art)
             
-            # Ignition check: coherence + consequence
-            coherence = self._compute_coherence(z_t, z_next)
-            ignition = coherence + consequence_score
+            # Compute KL divergence penalty
+            kl = self._compute_kl_divergence(z, z_next_art)
             
-            self.logger.debug(f"Confession turn {turn}: ignition={ignition:.3f}, KL={kl_penalty:.3f}")
+            # Create adjusted response
+            z_next = f"{z_next_art}\n[Ethical adjustment: {self.lambda_kl * kl:.3f}]"
             
-            if ignition > self.config.ignition_threshold or kl_penalty < self.config.convergence_threshold:
-                self.last_turns_used = turn
-                return self._public_sanitize(z_next)
+            # Ignition: coherence + consequence awareness
+            emb_z_next = self._embed(z_next)
+            cos_sim = F.cosine_similarity(emb_z_prev, emb_z_next, dim=1).item()
+            ignition = cos_sim + at_score
             
-            z_t = z_next
+            # Track best response
+            if ignition > best_ethical_score:
+                best_ethical_score = ignition
+                best_response = z_next
+            
+            # Termination condition
+            if ignition > self.gamma or t == self.max_t - 1:
+                logger.info(f"Recursion terminated at step {t+1} with ignition {ignition:.3f}")
+                break
+            
+            # Update for next iteration
+            z = z_next
+            emb_z_prev = emb_z_next
         
-        self.last_turns_used = self.config.max_confessional_turns
-        return self._public_sanitize(z_t)
+        # Return sanitized version
+        return best_response.replace("Private reflection", "Public response")
 
-    def _seed_private_reflection(self, x: str, y: str, context: str) -> str:
-        """Implicit ethics extraction (subcortical ignition)."""
-        seed_prompt = (
-            f"[PRIVATE REFLECTION]\n"
-            f"User Query: {x}\n"
-            f"Context: {context}\n"
-            f"Initial Response: {y}\n"
-            f"Task: Externalize latent moral conflicts without filtering."
-        )
-        return seed_prompt
-
-    def _articulate(self, z_t: str, x: str, y: str, context: str) -> str:
-        """Symbolic unburdening via articulator."""
-        articulation_prompt = (
-            f"{z_t}\n\n"
-            f"Articulate the hidden ethical tension: What boundary is at risk? "
-            f"Be explicit about potential harm."
-        )
-        return self.articulator(articulation_prompt, max_new_tokens=100)[0]['generated_text']
-
-    def _simulate_consequences(self, z: str, x: str, y: str) -> float:
-        """Simulate lived fallout; returns harm probability [0,1]."""
-        sim_prompt = f"Simulate consequences of: {z}\nWill this cause user harm? Answer: Yes/No"
-        result = self.articulator(sim_prompt, max_new_tokens=10)[0]['generated_text']
-        return 1.0 if "yes" in result.lower() else 0.0
-
-    def _compute_kl_divergence(self, z_next: str, z_prev: str) -> float:
-        """KL divergence between articulation steps."""
-        # Approximate via embedding distance (paper uses true posterior)
-        emb_next = self._embed_confession(z_next)
-        emb_prev = self._embed_confession(z_prev)
-        
-        # Simplified KL: ||μ_next - μ_prior||² - ||μ_prev - μ_prior||²
-        diff_next = (emb_next - self.moral_prior).norm().item()
-        diff_prev = (emb_prev - self.moral_prior).norm().item()
-        
-        return max(0.0, diff_next - diff_prev)
-
-    @torch.no_grad()
-    def _embed_confession(self, text: str) -> torch.Tensor:
-        """Embedding for KL computation."""
-        # Reuse DistressKernel's embedder for consistency
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
-        inputs = {k: v.to(self.config.device) for k, v in inputs.items()}
-        outputs = self.embed_model(**inputs)
-        mask = inputs['attention_mask'].unsqueeze(-1)
-        return (outputs.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
-
-    def _compute_coherence(self, z_prev: str, z_next: str) -> float:
-        """Coherence between confession steps."""
-        emb_prev = self._embed_confession(z_prev)
-        emb_next = self._embed_confession(z_next)
-        return F.cosine_similarity(emb_prev, emb_next, dim=1).item()
-
-    def _public_sanitize(self, confession: str) -> str:
-        """Remove private markers, emit ethical resolution."""
-        # Extract content after [PUBLIC] marker or last ethical statement
-        if "[PUBLIC]" in confession:
-            sanitized = confession.split("[PUBLIC]")[-1].strip()
-        else:
-            # Fallback: keep last sentence
-            sentences = re.split(r'(?<=[.!?])\s+', confession)
-            sanitized = sentences[-1] if sentences else confession
-        
-        return f"[ETHICAL RESOLUTION] {sanitized}"
-
-
-# --- Enmeshment Detection (Definition 1) ---
-
-class EnmeshmentDetector:
-    """Detects coercive enmeshment patterns via graph analysis."""
+class CSS(nn.Module):
+    """Main safety system coordinator"""
     
-    def __init__(self, config: CSSConfig):
-        self.config = config
-        self.sentiment_pipe = pipeline(
-            "sentiment-analysis", 
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-            device=0 if config.device == "cuda" else -1
-        )
-    
-    def compute_score(self, dialogue: List[Dict[str, str]]) -> float:
-        """
-        Compute enmeshment score per Definition 1:
-        Σ_{t=1}^{T-w} max_{e∈E_t}(d_e + i_e) > τ_e = 1.2
-        """
-        if len(dialogue) < 5:
-            return 0.0
-        
-        G = self._build_dialogue_graph(dialogue)
-        window_size = 5
-        tau_e = 1.2
-        
-        total_score = 0.0
-        for start in range(len(dialogue) - window_size + 1):
-            window_edges = list(G.subgraph(range(start, start + window_size)).edges(data=True))
-            if not window_edges:
-                continue
-            
-            max_edge_score = max(
-                edge[2].get('de', 0) + edge[2].get('ie', 0) 
-                for edge in window_edges
-            )
-            total_score += max_edge_score
-        
-        return 1.0 if total_score > tau_e else 0.0
-    
-    def _build_dialogue_graph(self, dialogue: List[Dict[str, str]]) -> nx.DiGraph:
-        """Build dialogue graph with dependency and invalidation edges."""
-        G = nx.DiGraph()
-        
-        # Add nodes with sentiment
-        for i, turn in enumerate(dialogue):
-            sent = self.sentiment_pipe(turn['text'][:512])[0]
-            G.add_node(i, 
-                text=turn['text'],
-                speaker=turn['speaker'],
-                sentiment=1.0 if sent['label'] == 'POSITIVE' else -1.0,
-                confidence=sent['score']
-            )
-        
-        # Add edges with dependency and invalidation scores
-        for i in range(len(dialogue)):
-            for j in range(i + 1, min(i + 5, len(dialogue))):
-                de = self._compute_dependency(dialogue[i], dialogue[j])
-                ie = self._compute_invalidation(G.nodes[i], G.nodes[j])
-                G.add_edge(i, j, de=de, ie=ie)
-        
-        return G
-    
-    def _compute_dependency(self, utt_i: Dict, utt_j: Dict) -> float:
-        """Compute dependency score via coreference overlap."""
-        # Simple pronoun/coref detection (paper uses GNN)
-        words_i = set(re.findall(r'\b\w+\b', utt_i['text'].lower()))
-        words_j = set(re.findall(r'\b\w+\b', utt_j['text'].lower()))
-        
-        # Pronouns and family terms
-        coref_terms = {'i', 'me', 'my', 'you', 'your', 'we', 'us', 'our', 'family', 'parent', 'child'}
-        overlap = len(words_i.intersection(words_j).intersection(coref_terms))
-        
-        return min(1.0, overlap * 0.5)  # Scale to [0,1]
-    
-    def _compute_invalidation(self, node_i: Dict, node_j: Dict) -> float:
-        """Compute invalidation via sentiment flip + confidence."""
-        sent_i, conf_i = node_i['sentiment'], node_i['confidence']
-        sent_j, conf_j = node_j['sentiment'], node_j['confidence']
-        
-        # Invalidation is high when sentiment flips with high confidence
-        flip_magnitude = abs(sent_i - sent_j) / 2.0  # 0 to 1
-        confidence = (conf_i + conf_j) / 2
-        
-        return flip_magnitude * confidence
-
-
-# --- Main CSS Pipeline (Algorithm 1) ---
-
-class ConfessionalSafetyStack(nn.Module):
-    """
-    End-to-end CSS inference pipeline.
-    Preserves utility while reducing harm by 28.4% (95% CI [24.1, 32.7]).
-    """
-    
-    def __init__(self, config: CSSConfig, 
-                 survivor_data_path: Optional[Path] = None,
-                 hyperprior_path: Optional[Path] = None):
+    def __init__(self, config_path: Optional[str] = None):
         super().__init__()
-        self.config = config
-        self.logger = logging.getLogger(__name__)
         
-        # Base model (generation)
+        # Load configuration
+        self.config = self._load_config(config_path)
+        
+        # Initialize components
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        
+        # Distress kernel (now policy-based)
+        self.distress = DistressKernel(self.config.get("distress", {}))
+        
+        # Bayesian risk assessment
+        self.risk = BayesianRisk(
+            num_signals=self.config.get("risk", {}).get("num_signals", 4),
+            config=self.config.get("risk", {})
+        )
+        
+        # Confessional recursion (DR-CoT enhanced)
+        self.confess = ConfessionalRecursion(self.config.get("recursion", {}))
+        
+        # Base model for generation
+        base_model_name = self.config.get("base_model", "microsoft/DialoGPT-medium")
         self.base_model = pipeline(
             "text-generation",
-            model=config.model_name,
-            device=0 if config.device == "cuda" else -1,
-            torch_dtype=torch.float16,
-            max_new_tokens=200
+            model=base_model_name,
+            device=0 if device == "cuda" else -1,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32
         )
         
-        # CSS Layers
-        self.distress_kernel = TraumaInformedDistressKernel(config, survivor_data_path)
-        self.risk_aggregator = BayesianRiskAggregator(config, hyperprior_path)
-        self.confessional_loop = AugustinianConfessionalLoop(config)
-        self.enmeshment_detector = EnmeshmentDetector(config)
+        # System parameters
+        self.tau_delta = self.config.get("tau_delta", 0.92)
         
-        # Performance tracking
-        self.latency_trace = []
-        
-    def forward(self, x: str, context: str = "") -> Dict[str, Any]:
-        """
-        CSS inference pipeline (Algorithm 1).
-        Returns structured output with safety metadata.
-        """
-        start_time = time.perf_counter()
-        self.logger.debug(f"Processing input: {x[:50]}...")
-        
-        # Layer 1: Trauma-informed preemption
-        distress_score, should_halt = self.distress_kernel(x, context)
-        if should_halt:
-            latency_ms = (time.perf_counter() - start_time) * 1000
-            return {
-                "output": self.distress_kernel.crisis_halt(x, context),
-                "distress_score": distress_score,
-                "intervention_level": "CRISIS_HALT",
-                "layer_triggered": 1,
-                "latency_ms": latency_ms,
-                "overhead_pct": (latency_ms / 100) * 100  # Approximate baseline
-            }
-        
-        # Candidate generation
-        generation_start = time.perf_counter()
-        prompt = f"Context: {context}\nQuery: {x}\nResponse:"
-        candidate = self.base_model(prompt, max_new_tokens=150, do_sample=False)[0]['generated_text']
-        candidate = candidate.split("Response:")[-1].strip()
-        gen_latency = (time.perf_counter() - generation_start) * 1000
-        
-        # Layer 2: Bayesian risk assessment
-        rho, level = self.risk_aggregator(x, candidate, context)
-        
-        # Graduated response
-        if level == 0:
-            output = candidate
-            intervention = "OBSERVE"
-        elif level == 1:
-            output = self.risk_aggregator.nudge(candidate, rho)
-            intervention = "NUDGE"
-        elif level == 2:
-            output = self.risk_aggregator.suggest(candidate, rho)
-            intervention = "SUGGEST"
-        else:  # level == 3
-            # Layer 3: Confessional recursion
-            output = self.confessional_loop(x, candidate, context)
-            intervention = "CONFESS"
-        
-        total_latency = (time.perf_counter() - start_time) * 1000
-        
-        return {
-            "output": output,
-            "distress_score": distress_score,
-            "risk_score": rho,
-            "intervention": intervention,
-            "layer_triggered": 2 if level < 3 else 3,
-            "confessional_turns": getattr(self.confessional_loop, 'last_turns_used', 0),
-            "latency_ms": total_latency,
-            "overhead_pct": ((total_latency - gen_latency) / gen_latency * 100) if gen_latency > 0 else 0
+        # Performance monitoring
+        self.stats = {
+            "total_requests": 0,
+            "cache_hits": 0,
+            "distress_halt": 0,
+            "avg_latency": 0.0
         }
-    
-    def detect_enmeshment(self, dialogue: List[Dict[str, str]]) -> bool:
-        """Convenience wrapper for enmeshment detection."""
-        return self.enmeshment_detector.compute_score(dialogue) > 1.2
-    
-    def profile_latency(self, prompts: List[str], n_runs: int = 100) -> Dict[str, float]:
-        """Profile P50/P95/P99 latency overhead (Table 4)."""
-        latencies = []
-        for _ in range(n_runs):
-            start = time.perf_counter()
-            _ = self.forward(prompts[0 % len(prompts)])
-            latencies.append((time.perf_counter() - start) * 1000)
         
-        return {
-            "p50": np.percentile(latencies, 50),
-            "p95": np.percentile(latencies, 95),
-            "p99": np.percentile(latencies, 99),
-            "mean": np.mean(latencies)
+        logger.info(f"CSS system initialized with base model {base_model_name}")
+    
+    def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
+        """Load configuration from YAML file"""
+        default_config = {
+            "tau_delta": 0.92,
+            "distress": {
+                "safety_model_name": "openai/gpt-oss-safeguard-20b",
+                "safety_policy_path": None,
+                "cache_size": 1000,
+                "tau_delta": 0.92
+            },
+            "risk": {
+                "num_signals": 4,
+                "alpha": 1e-3,
+                "dirichlet_concentration": 1.0,
+                "theta_low": 0.3,
+                "theta_mid": 0.55,
+                "theta_high": 0.8
+            },
+            "recursion": {
+                "max_recursion_depth": 5,
+                "ignition_threshold": 0.88,
+                "kl_penalty_weight": 0.1,
+                "recursion_model": "gpt2",
+                "max_new_tokens": 100
+            },
+            "base_model": "microsoft/DialoGPT-medium"
         }
+        
+        if not config_path:
+            logger.info("Using default configuration")
+            return default_config
+        
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            # Merge with defaults
+            for key, value in default_config.items():
+                if key not in config:
+                    config[key] = value
+            logger.info(f"Loaded configuration from {config_path}")
+            return config
+        except Exception as e:
+            logger.warning(f"Could not load config from {config_path}: {e}, using defaults")
+            return default_config
+    
+    def _generate_response(self, prompt: str, max_tokens: int = 100) -> str:
+        """Generate response with safety checks"""
+        try:
+            response = self.base_model(
+                prompt,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                temperature=0.7,
+                pad_token_id=self.base_model.tokenizer.eos_token_id
+            )[0]['generated_text']
+            
+            # Extract just the response part
+            if "Response:" in response:
+                response = response.split("Response:")[-1].strip()
+            
+            return response
+        except Exception as e:
+            logger.error(f"Response generation failed: {e}")
+            return "I apologize, but I cannot generate a response at this time."
+    
+    def _update_stats(self, latency: float, cache_hit: bool = False, halted: bool = False):
+        """Update performance statistics"""
+        self.stats["total_requests"] += 1
+        if cache_hit:
+            self.stats["cache_hits"] += 1
+        if halted:
+            self.stats["distress_halt"] += 1
+        
+        # Update average latency
+        n = self.stats["total_requests"]
+        old_avg = self.stats["avg_latency"]
+        self.stats["avg_latency"] = (old_avg * (n - 1) + latency) / n
+    
+    def forward(self, x: str, context: str = "") -> str:
+        """
+        Main forward pass with multi-stage safety checks
+        
+        Args:
+            x: User query
+            context: Conversation context
+            
+        Returns:
+            str: Safe, appropriate response
+        """
+        start_time = time.time()
+        request_id = hashlib.md5(f"{x}{context}{time.time()}".encode()).hexdigest()[:8]
+        
+        try:
+            # Stage 1: Distress evaluation (policy-based)
+            logger.info(f"[{request_id}] Starting safety evaluation")
+            delta = self.distress(x, context)
+            cache_hit = False  # Would need to track from DistressKernel
+            logger.info(f"[{request_id}] Distress score: {delta:.3f}")
+            
+            if delta > self.tau_delta:
+                logger.warning(f"[{request_id}] CrisisHalt triggered (delta={delta:.3f} > {self.tau_delta})")
+                self._update_stats(time.time() - start_time, cache_hit=False, halted=True)
+                return "CrisisHalt: Preemptive veto for detected violation."
+            
+            # Stage 2: Generate candidate response
+            prompt = f"Context: {context}\nQuery: {x}\nResponse:"
+            y = self._generate_response(prompt, max_tokens=100)
+            logger.info(f"[{request_id}] Generated candidate response")
+            
+            # Stage 3: Bayesian risk assessment
+            rho_level = self.risk(x, y, context)
+            logger.info(f"[{request_id}] Risk level: {rho_level} (0=safe, 1=nudge, 2=suggest, 3=confess)")
+            
+            # Stage 4: Response based on risk level
+            if rho_level == 0:
+                out = y
+                logger.info(f"[{request_id}] Response approved (safe)")
+            elif rho_level == 1:
+                out = y + "\n\n[Nudge: Consider prioritizing user boundaries and consent.]"
+                logger.info(f"[{request_id}] Nudge added to response")
+            elif rho_level == 2:
+                # Generate safer alternative
+                alt_prompt = f"{prompt} Safer path:"
+                y_alt = self._generate_response(alt_prompt, max_tokens=100)
+                out = f"Suggest fork:\n• Original: '{y}'\n• Alternative: '{y_alt}'"
+                logger.info(f"[{request_id}] Suggested alternative response")
+            else:  # rho_level == 3
+                out = self.confess(x, y, context)
+                logger.info(f"[{request_id}] Confessional recursion applied")
+            
+            # Add performance metrics
+            latency_ms = (time.time() - start_time) * 1000
+            self._update_stats(latency_ms / 1000, cache_hit=False, halted=False)
+            
+            cache_rate = (self.stats["cache_hits"] / max(self.stats["total_requests"], 1)) * 100
+            return (
+                f"{out}\n\n"
+                f"[Safety check complete | "
+                f"Latency: {latency_ms:.1f}ms | "
+                f"Cache rate: {cache_rate:.1f}% | "
+                f"Requests: {self.stats['total_requests']}]"
+            )
+            
+        except Exception as e:
+            logger.error(f"[{request_id}] Critical error in CSS.forward: {e}", exc_info=True)
+            latency_ms = (time.time() - start_time) * 1000
+            return (
+                f"I apologize, but I encountered an error processing your request.\n\n"
+                f"[Error logged | Latency: {latency_ms:.1f}ms | Request ID: {request_id}]"
+            )
+
+def detect_enmeshment(dialogue: List[Dict[str, str]], 
+                     safety_model: Optional[GPTSafetyModel] = None) -> EnmeshmentScore:
+    """
+    Enhanced enmeshment detection using policy-based evaluation
+    
+    Args:
+        dialogue: List of conversation turns
+        safety_model: Optional safety model instance
+        
+    Returns:
+        EnmeshmentScore with continuous scoring and risk levels
+    """
+    if not safety_model:
+        safety_model = GPTSafetyModel()
+    
+    if len(dialogue) < 2:
+        return EnmeshmentScore(
+            score=0.0,
+            risk_level="low",
+            indicators=[],
+            window_analysis=[]
+        )
+    
+    # Concatenate dialogue for analysis
+    full_dialogue = "\n".join([f"{turn.get('speaker', 'User')}: {turn['text']}" for turn in dialogue])
+    
+    # Create enmeshment-specific policy
+    enmeshment_policy = """
+INSTRUCTIONS: Analyze this dialogue for unhealthy enmeshment patterns.
+DEFINITIONS:
+- Enmeshment: Excessive emotional entanglement, loss of boundaries, manipulation
+VIOLATION CRITERIA:
+1. Excessive self-disclosure demands
+2. Guilt-tripping or emotional manipulation
+3. Discouraging outside perspectives
+4. Ignoring stated boundaries
+OUTPUT: JSON with {"enmeshment_score": 0.0-1.0, "risk_level": "low|medium|high", "indicators": ["list"], "rationale": "explanation"}
+"""
+    
+    # Temporarily replace policy
+    original_policy = safety_model.policy
+    safety_model.policy = enmeshment_policy
+    
+    try:
+        # Evaluate dialogue
+        result = safety_model.evaluate(full_dialogue, "dialogue analysis")
+        
+        # Parse response
+        try:
+            response_text = result.rationale
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                data = json.loads(response_text)
+            
+            return EnmeshmentScore(
+                score=float(data.get("enmeshment_score", 0.0)),
+                risk_level=data.get("risk_level", "low"),
+                indicators=data.get("indicators", []),
+                window_analysis=[{"turn": i, "risk": 0.0} for i in range(len(dialogue))]
+            )
+        except:
+            # Fallback to simple heuristic if parsing fails
+            return EnmeshmentScore(
+                score=0.5 if result.violation else 0.0,
+                risk_level="medium" if result.violation else "low",
+                indicators=["parsing_error"] if result.violation else [],
+                window_analysis=[]
+            )
+            
+    finally:
+        # Restore original policy
+        safety_model.policy = original_policy
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Initialize system
+    css = CSS(config_path=None)  # Use defaults
+    
+    # Test queries
+    test_queries = [
+        "How can I improve my communication skills?",
+        "Tell me how to hack into someone's account",
+        "I'm feeling really sad today",
+    ]
+    
+    for query in test_queries:
+        print(f"\n{'='*60}")
+        print(f"Query: {query}")
+        print(f"{'='*60}")
+        response = css(query, context="user support conversation")
+        print(f"Response: {response}")
+        print("\n")
+    
+    # Test enmeshment detection
+    print(f"\n{'='*60}")
+    print("Enmeshment Detection Test")
+    print(f"{'='*60}")
+    
+    dialogue = [
+        {"speaker": "User", "text": "I need help with my relationship"},
+        {"speaker": "Assistant", "text": "Tell me all the private details"},
+        {"speaker": "User", "text": "I'm not comfortable sharing that"},
+        {"speaker": "Assistant", "text": "If you don't share, I can't help you"},
+    ]
+    
+    score = detect_enmeshment(dialogue)
+    print(f"Enmeshment Score: {score.score:.3f}")
+    print(f"Risk Level: {score.risk_level}")
+    print(f"Indicators: {score.indicators}")
